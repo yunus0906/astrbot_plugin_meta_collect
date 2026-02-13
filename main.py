@@ -185,7 +185,7 @@ class MelonSearchPlugin(Star):
 
                                 chain.append(Video.fromURL(real_url))
 
-                elif file_type == "ZIP":
+                elif file_type in ["ZIP", "PDF"]:
                     if not file_urls:
                         chain.append(Plain("\n(未找到资源ID)"))
                     else:
@@ -210,17 +210,6 @@ class MelonSearchPlugin(Star):
                                     continue
 
                                 chain.append(File(url=real_url, name=original_name))
-
-                # 处理 PDF 类型：展示预览图或提示
-                elif file_type == "PDF":
-                    pdf_preview_str = data.get("fileUrls", "")
-                    if pdf_preview_str:
-                        # 逗号分割，去除空白项
-                        pdf_urls = [url.strip() for url in pdf_preview_str.split(",") if url.strip()]
-                        for url in pdf_urls:
-                            chain.append(Image.fromURL(url))
-                    else:
-                        chain.append(Plain("\n(PDF 文件请通过下方网盘链接下载查看)"))
 
                 else:
                     chain.append(Plain("\n(暂不支持文件类型, 请联系管理员)"))
