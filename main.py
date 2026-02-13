@@ -1,4 +1,5 @@
 import aiohttp
+import os
 from typing import Optional, Dict, Any, List
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
@@ -77,6 +78,50 @@ class MelonSearchPlugin(Star):
 
         return (real_url, original_name) if real_url else None
 
+    async def _get_all_group_files(self, group_id: int, bot) -> List[Dict]:
+        """
+        获取群文档中的所有文件列表（递归获取所有文件夹）
+        兼容现有的群文件获取实现
+
+        Returns:
+            包含文件信息的列表，每个元素为 dict，至少包含 'file_name' 和 'file_id'
+        """
+        try:
+            from .src.file_ops import get_all_files_recursive_core
+            all_files = await get_all_files_recursive_core(group_id, bot)
+            logger.info(f"从群 {group_id} 获取到 {len(all_files)} 个群文档文件")
+            return all_files
+        except Exception as e:
+            logger.warning(f"获取群文档列表失败: {e}")
+            return []
+
+    def _find_file_in_group(self, code: str, group_files: List[Dict]) -> Optional[Dict]:
+        """
+        在群文档列表中查找匹配的文件
+        文件名规则：文件名（不含扩展名）与 code 完全一致
+
+        Args:
+            code: 要查找的 code
+            group_files: 群文档文件列表
+
+        Returns:
+            匹配的文件信息 dict 或 None
+        """
+        if not group_files:
+            return None
+
+        for file_info in group_files:
+            file_name = file_info.get('file_name', '')
+            # 去除扩展名
+            base_name, _ = os.path.splitext(file_name)
+
+            # 文件名（不含扩展名）与 code 完全匹配
+            if base_name == code:
+                logger.info(f"在群文档中找到匹配文件: {file_name} (code: {code})")
+                return file_info
+
+        return None
+
     def _format_search_result(self, item: Dict) -> str:
         """格式化单条搜索结果"""
         cid = item.get("code") or item.get("id")
@@ -139,7 +184,27 @@ class MelonSearchPlugin(Star):
         cid_arg = parts[1].strip()
         yield event.plain_result(f"⏳ 正在查询 {cid_arg}，请稍等...")
 
-        # 查询详情
+        # 1. 尝试从群文档获取文件
+        group_id_str = event.get_group_id()
+        group_file = None
+
+        if group_id_str and event.bot:
+            try:
+                group_id = int(group_id_str)
+                logger.info(f"正在检查群 {group_id} 的文档...")
+                group_files = await self._get_all_group_files(group_id, event.bot)
+                group_file = self._find_file_in_group(cid_arg, group_files)
+
+                if group_file:
+                    logger.info(f"✅ 在群文档中找到文件，跳过网络请求")
+                    # 直接返回群文档文件
+                    chain = await self._build_group_file_chain(group_file, cid_arg)
+                    yield event.chain_result(chain)
+                    return
+            except Exception as e:
+                logger.warning(f"检查群文档时出错: {e}，继续使用网络查询")
+
+        # 2. 群文档中未找到，查询详情接口
         query_url = f"{self.base_url}/media/mediaData/web/query"
         raw_data = await self._fetch_json(query_url, params={"code": cid_arg})
 
@@ -152,7 +217,7 @@ class MelonSearchPlugin(Star):
             yield event.plain_result(f"❌ 未找到 Code 为 {cid_arg} 的资源")
             return
 
-        # 构建消息链
+        # 3. 构建消息链（网络文件）
         chain = await self._build_detail_chain(data, cid_arg)
         yield event.chain_result(chain)
 
@@ -190,6 +255,57 @@ class MelonSearchPlugin(Star):
             chain.append(Plain(f"\n📌 详情：【{netdisk_type}】\n🔗 {netdisk_url}"))
 
         return chain
+
+    async def _build_group_file_chain(self, group_file: Dict, code: str) -> List:
+        """
+        构建群文档文件的消息链
+
+        Args:
+            group_file: 群文档文件信息
+            code: 文件 code
+        """
+        chain = []
+
+        file_name = group_file.get('file_name', '未知文件')
+        file_id = group_file.get('file_id', '')
+        # 注意：你的实现中使用的是 'size' 而不是 'file_size'
+        file_size = group_file.get('size', 0)
+        parent_folder = group_file.get('parent_folder_name', '根目录')
+
+        # 根据扩展名判断文件类型
+        _, ext = os.path.splitext(file_name)
+        ext_upper = ext.upper().lstrip('.')
+
+        # 映射扩展名到 emoji
+        emoji = EMOJI_MAP.get(ext_upper, EMOJI_MAP["DEFAULT"])
+
+        # 格式化文件大小
+        size_str = self._format_file_size(file_size)
+
+        # 添加标题和信息
+        text = (
+            f"{emoji} 群文件内已存在: {file_name}\n"
+            f"📂 所在文件夹：{parent_folder}\n"
+            f"📦 文件大小：{size_str}\n"
+            f"🔑 如需解压密码请查看公告"
+        )
+
+        chain.append(Plain(text))
+
+        logger.info(f"从群文档返回文件: {file_name}, 大小: {size_str}")
+
+        return chain
+
+    def _format_file_size(self, size_bytes: int) -> str:
+        """格式化文件大小"""
+        if size_bytes < 1024:
+            return f"{size_bytes} B"
+        elif size_bytes < 1024 * 1024:
+            return f"{size_bytes / 1024:.2f} KB"
+        elif size_bytes < 1024 * 1024 * 1024:
+            return f"{size_bytes / (1024 * 1024):.2f} MB"
+        else:
+            return f"{size_bytes / (1024 * 1024 * 1024):.2f} GB"
 
     async def _add_images(self, chain: List, data: Dict):
         """添加图片到消息链"""
