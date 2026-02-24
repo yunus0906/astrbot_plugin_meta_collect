@@ -1,10 +1,13 @@
 import aiohttp
 import os
+import asyncio
+import datetime
 from typing import Optional, Dict, Any, List
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 from astrbot.api.message_components import Image, Plain, Video, File
 from astrbot.api import logger
+from astrbot.core.message.message_event_result import MessageChain
 
 # 文件类型对应的 Emoji 映射
 EMOJI_MAP = {
@@ -19,19 +22,50 @@ EMOJI_MAP = {
 
 @register("astrbot_plugin_meta_collect", "yunus", "元采集平台搜索插件", "1.0.0")
 class MelonSearchPlugin(Star):
-    def __init__(self, context: Context):
+    def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
-        self.base_url = "http://localhost:8080"
+        self.config = config or {}
+        self.base_url = self.config.get("base_url", "http://localhost:8080")
         self._session: Optional[aiohttp.ClientSession] = None
 
+        # 定时推送配置
+        self.push_enabled = self.config.get("push_enabled", False)
+        self.push_times = self.config.get("push_times", "08:00,12:00,17:00")
+        self.push_check_hours = self.config.get("push_check_hours", 12)
+        self.push_target_groups = self.config.get("push_target_groups", [])
+
+        # 定时任务列表
+        self._push_tasks = []
+
     async def initialize(self):
-        """初始化时创建持久化的 HTTP 会话"""
+        """初始化时创建持久化的 HTTP 会话和启动定时任务"""
         self._session = aiohttp.ClientSession()
 
+        # 启动定时推送任务
+        if self.push_enabled and self.push_target_groups:
+            for push_time in self._parse_push_times():
+                task = asyncio.create_task(self.push_task(push_time))
+                self._push_tasks.append(task)
+            logger.info(f"[瓜推送] 已启动 {len(self._push_tasks)} 个定时推送任务")
+        else:
+            logger.info("[瓜推送] 定时推送功能未启用或未配置目标群组")
+
     async def terminate(self):
-        """终止时关闭会话"""
+        """终止时关闭会话和取消定时任务"""
+        # 取消所有定时任务
+        for task in self._push_tasks:
+            task.cancel()
+
+        # 关闭会话
         if self._session:
             await self._session.close()
+
+        logger.info("[瓜推送] 已停止所有定时任务和会话")
+
+    def _parse_push_times(self) -> List[str]:
+        """解析推送时间配置，返回时间列表"""
+        times = self.push_times.split(",")
+        return [t.strip() for t in times if t.strip()]
 
     # ==========================================================
     # 工具方法
@@ -129,6 +163,17 @@ class MelonSearchPlugin(Star):
         file_type = item.get("fileType", "DEFAULT")
         emoji = EMOJI_MAP.get(file_type, EMOJI_MAP["DEFAULT"])
         return f" {emoji}【{cid}】{title}"
+
+    def _format_file_size(self, size_bytes: int) -> str:
+        """格式化文件大小"""
+        if size_bytes < 1024:
+            return f"{size_bytes} B"
+        elif size_bytes < 1024 * 1024:
+            return f"{size_bytes / 1024:.2f} KB"
+        elif size_bytes < 1024 * 1024 * 1024:
+            return f"{size_bytes / (1024 * 1024):.2f} MB"
+        else:
+            return f"{size_bytes / (1024 * 1024 * 1024):.2f} GB"
 
     # ==========================================================
     # 指令：/搜瓜 [关键词]
@@ -268,7 +313,6 @@ class MelonSearchPlugin(Star):
 
         file_name = group_file.get('file_name', '未知文件')
         file_id = group_file.get('file_id', '')
-        # 注意：你的实现中使用的是 'size' 而不是 'file_size'
         file_size = group_file.get('size', 0)
         parent_folder = group_file.get('parent_folder_name', '根目录')
 
@@ -295,17 +339,6 @@ class MelonSearchPlugin(Star):
         logger.info(f"从群文档返回文件: {file_name}, 大小: {size_str}")
 
         return chain
-
-    def _format_file_size(self, size_bytes: int) -> str:
-        """格式化文件大小"""
-        if size_bytes < 1024:
-            return f"{size_bytes} B"
-        elif size_bytes < 1024 * 1024:
-            return f"{size_bytes / 1024:.2f} KB"
-        elif size_bytes < 1024 * 1024 * 1024:
-            return f"{size_bytes / (1024 * 1024):.2f} MB"
-        else:
-            return f"{size_bytes / (1024 * 1024 * 1024):.2f} GB"
 
     async def _add_images(self, chain: List, data: Dict):
         """添加图片到消息链"""
@@ -342,3 +375,247 @@ class MelonSearchPlugin(Star):
             if result:
                 real_url, original_name = result
                 chain.append(File(url=real_url, name=original_name or fallback_name))
+
+    @filter.command("新瓜")
+    async def check_updates(self, event: AstrMessageEvent, hours: int = None):
+        """
+        检查新瓜更新
+
+        Args:
+            hours: 检查最近多少小时，默认使用配置值
+        """
+        try:
+            check_hours = hours or self.push_check_hours
+            logger.info(f"[瓜推送] 手动检查最近 {check_hours} 小时的更新")
+
+            melons = await self.fetch_recent_updates(check_hours)
+            message_text = self.format_push_message(melons, check_hours)
+
+            yield event.plain_result(message_text)
+        except Exception as e:
+            logger.error(f"[瓜推送] 检查更新时出错: {e}")
+            yield event.plain_result(f"❌ 检查失败: {str(e)}")
+        finally:
+            event.stop_event()
+
+    # ==========================================================
+    # 定时推送功能
+    # ==========================================================
+
+    async def fetch_recent_updates(self, hours: int = 12) -> List[Dict]:
+        """
+        获取最近N小时更新的瓜
+
+        Args:
+            hours: 查询最近多少小时的更新
+
+        Returns:
+            瓜列表
+        """
+        try:
+            # 计算时间范围
+            now = datetime.datetime.now()
+            start_time = now - datetime.timedelta(hours=12)
+
+            params = {
+                "updateTimeStart": start_time.strftime("%Y-%m-%d %H:%M:%S"),
+                "updateTimeEnd": now.strftime("%Y-%m-%d %H:%M:%S"),
+                "status": "enable"
+            }
+
+            url = f"{self.base_url}/media/mediaData/web/list"
+            # params = {
+            #     "updateTime": update_time,
+            #     "status": "enable"
+            # }
+
+            logger.info(f"[瓜推送] 查询最近 {hours} 小时的更新，时间戳: {start_time}")
+
+            data = await self._fetch_json(url, params)
+
+            if data is None:
+                logger.error("[瓜推送] 接口请求失败")
+                return []
+
+            if not data:
+                logger.info(f"[瓜推送] 最近 {hours} 小时没有新瓜")
+                return []
+
+            logger.info(f"[瓜推送] 找到 {len(data)} 个新瓜")
+            return data
+
+        except Exception as e:
+            logger.error(f"[瓜推送] 获取新瓜时出错: {e}")
+            return []
+
+    def format_push_message(self, melons: List[Dict], hours: int) -> str:
+        """
+        格式化推送消息
+
+        Args:
+            melons: 瓜列表
+            hours: 时间范围（小时）
+
+        Returns:
+            格式化后的消息文本
+        """
+        if not melons:
+            return f"📢 最近 {hours} 小时没有新瓜更新"
+
+        msg_lines = [
+            f"🍉 新瓜速递 🍉",
+            f"━━━━━━━━━━━━━━━",
+            f"📊 最近 {hours} 小时更新了 {len(melons)} 个瓜：\n"
+        ]
+
+        for i, item in enumerate(melons, 1):
+            cid = item.get("code") or item.get("id")
+            title = item.get("title", "无标题")
+            file_type = item.get("fileType", "DEFAULT")
+            emoji = EMOJI_MAP.get(file_type, EMOJI_MAP["DEFAULT"])
+
+            # 获取更新时间
+            update_time = item.get("updateTime")
+            time_str = ""
+            if update_time:
+                try:
+                    dt = datetime.datetime.fromtimestamp(update_time / 1000)
+                    time_str = dt.strftime("%m-%d %H:%M")
+                except:
+                    pass
+
+            msg_lines.append(f"{i}. {emoji} [{cid}] {title}")
+            if time_str:
+                msg_lines.append(f"   ⏰ {time_str}")
+
+        msg_lines.append("\n━━━━━━━━━━━━━━━")
+        msg_lines.append("💡 输入 /cid [CODE] 查看详情")
+        msg_lines.append("🔑 如需解压密码请查看公告")
+
+        return "\n".join(msg_lines)
+
+    async def send_push_to_groups(self):
+        """向目标群组推送新瓜"""
+        try:
+            # 获取最近的瓜
+            melons = await self.fetch_recent_updates(self.push_check_hours)
+
+            if not self.push_target_groups:
+                logger.info("[瓜推送] 未配置目标群组")
+                return
+
+            # 格式化消息
+            message_text = self.format_push_message(melons, self.push_check_hours)
+
+            logger.info(f"[瓜推送] 准备向 {len(self.push_target_groups)} 个群组推送")
+
+            for group_id in self.push_target_groups:
+                try:
+                    message_chain = MessageChain()
+                    message_chain.chain = [Plain(message_text)]
+
+                    await self.context.send_message(str(group_id), message_chain)
+                    logger.info(f"[瓜推送] 已向群 {group_id} 推送新瓜通知")
+
+                    await asyncio.sleep(1)  # 避免发送过快
+                except Exception as e:
+                    logger.error(f"[瓜推送] 向群组 {group_id} 推送消息时出错: {e}")
+
+        except Exception as e:
+            logger.error(f"[瓜推送] 推送新瓜时出错: {e}")
+
+    def calculate_sleep_time(self, target_time: str) -> float:
+        """
+        计算到下一次推送时间的秒数
+
+        Args:
+            target_time: 目标时间，格式如 "08:00"
+
+        Returns:
+            需要等待的秒数
+        """
+        now = datetime.datetime.now()
+        hour, minute = map(int, target_time.split(":"))
+
+        target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if target <= now:
+            target += datetime.timedelta(days=1)
+
+        seconds = (target - now).total_seconds()
+        return seconds
+
+    async def push_task(self, push_time: str):
+        """
+        定时推送任务
+
+        Args:
+            push_time: 推送时间，格式如 "08:00"
+        """
+        logger.info(f"[瓜推送] 启动定时任务，推送时间: {push_time}")
+
+        while True:
+            try:
+                # 计算到下次推送的时间
+                sleep_time = self.calculate_sleep_time(push_time)
+                logger.info(f"[瓜推送-{push_time}] 下次推送将在 {sleep_time / 3600:.2f} 小时后")
+
+                # 等待到设定时间
+                await asyncio.sleep(sleep_time)
+
+                # 推送新瓜
+                logger.info(f"[瓜推送-{push_time}] 开始执行推送")
+                await self.send_push_to_groups()
+
+                # 等待一段时间，避免重复推送
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                logger.info(f"[瓜推送-{push_time}] 定时任务已取消")
+                break
+            except Exception as e:
+                logger.error(f"[瓜推送-{push_time}] 定时任务出错: {e}")
+                await asyncio.sleep(300)
+
+    @filter.command("gua_push_now")
+    async def manual_push(self, event: AstrMessageEvent):
+        """手动触发推送"""
+        try:
+            logger.info("[瓜推送] 手动触发推送")
+            await self.send_push_to_groups()
+
+            yield event.plain_result(
+                f"✅ 已成功向 {len(self.push_target_groups)} 个群组推送新瓜通知"
+            )
+        except Exception as e:
+            logger.error(f"[瓜推送] 手动推送时出错: {e}")
+            yield event.plain_result(f"❌ 推送失败: {str(e)}")
+        finally:
+            event.stop_event()
+
+    @filter.command("gua_push_status")
+    async def check_push_status(self, event: AstrMessageEvent):
+        """查看推送状态"""
+        status_msg = [
+            "🍉 瓜推送插件状态",
+            "━━━━━━━━━━━━━━━"
+        ]
+
+        if self.push_enabled:
+            status_msg.extend([
+                f"✅ 状态: 已启用",
+                f"📍 目标群组: {', '.join(map(str, self.push_target_groups))}",
+                f"⏰ 推送时间: {self.push_times}",
+                f"🕐 检查时长: 最近{self.push_check_hours}小时",
+                f"📊 任务数量: {len(self._push_tasks)}个"
+            ])
+
+            # 计算每个任务的下次推送时间
+            status_msg.append("\n⏰ 下次推送时间:")
+            for push_time in self._parse_push_times():
+                sleep_time = self.calculate_sleep_time(push_time)
+                hours = int(sleep_time / 3600)
+                minutes = int((sleep_time % 3600) / 60)
+                status_msg.append(f"  • {push_time} - 还有{hours}小时{minutes}分钟")
+        else:
+            status_msg.append("❌ 状态: 未启用")
+
+        yield event.plain_result("\n".join(status_msg))

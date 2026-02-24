@@ -1,0 +1,26 @@
+{
+  "push_enabled": {
+    "description": "是否启用定时推送",
+    "type": "bool",
+    "hint": "",
+    "default": false
+  },
+  "push_target_groups": {
+    "description": "需要推送的群组唯一标识符列表",
+    "type": "list",
+    "hint": "填写需要接收60s新闻推送的群组唯一标识符，如: 你的平台名称(自己起的):GroupMessage:1350989414, napcat:FriendMessage:123456, telegram:FriendMessage:123456",
+    "default": [""]
+  },
+  "push_times": {
+    "description": "推送时间(以服务器时区为准)",
+    "type": "string",
+    "hint": "填写推送的时间，如: 08:00,12:00,17:00",
+    "default": "08:00,12:00,17:00"
+  },
+  "push_check_hours": {
+        "description": "搜索多长时间内的内容",
+        "hint": "",
+        "type": "int",
+        "default": 12
+  }
+}
