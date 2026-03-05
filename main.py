@@ -25,7 +25,7 @@ class MelonSearchPlugin(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
         self.config = config or {}
-        self.base_url = self.config.get("base_url", "http://localhost:8080")
+        self.base_url = self.config.get("base_url", "http://m.bee.nofuzz.cn")
         self._session: Optional[aiohttp.ClientSession] = None
 
         # 定时推送配置
